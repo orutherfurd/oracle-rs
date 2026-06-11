@@ -21,6 +21,9 @@ pub struct FetchMessage {
     orientation: Option<FetchOrientation>,
     /// Fetch offset/position for scrollable cursors
     offset: i64,
+    /// TTC message sequence number — must continue the connection's sequence;
+    /// sending 0 desyncs the server (it replies with a break MARKER).
+    sequence_number: u8,
 }
 
 impl FetchMessage {
@@ -31,7 +34,13 @@ impl FetchMessage {
             num_rows,
             orientation: None,
             offset: 0,
+            sequence_number: 0,
         }
+    }
+
+    /// Set the TTC sequence number (from `Connection::next_sequence_number`).
+    pub fn set_sequence_number(&mut self, seq: u8) {
+        self.sequence_number = seq;
     }
 
     /// Create a new scrollable fetch message
@@ -46,6 +55,7 @@ impl FetchMessage {
             num_rows,
             orientation: Some(orientation),
             offset,
+            sequence_number: 0,
         }
     }
 
@@ -56,7 +66,7 @@ impl FetchMessage {
         // Write message header
         buf.write_u8(MessageType::Function as u8)?;
         buf.write_u8(FunctionCode::Fetch as u8)?;
-        buf.write_u8(0)?; // Sequence number
+        buf.write_u8(self.sequence_number)?; // Sequence number (0 desyncs the server)
 
         // Write fetch body
         buf.write_ub4(self.cursor_id as u32)?;
