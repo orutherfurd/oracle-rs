@@ -730,11 +730,9 @@ pub struct Connection {
     config: Config,
     closed: AtomicBool,
     id: u32,
-    /// Rows requested from the server per query/fetch. Because incremental
-    /// `fetch_more` is currently broken on pre-23c servers (see fetch_more),
-    /// callers that expect large result sets should raise this so the whole
-    /// result is returned by the initial execute (which handles multi-packet
-    /// responses correctly).
+    /// Rows requested from the server per query in the initial execute. Raising
+    /// this lets large result sets come back in one round-trip instead of via
+    /// repeated `fetch_more` calls; it has no effect on correctness.
     prefetch_rows: AtomicU32,
     /// The TTC field version negotiated with the server, cached for sync access
     /// from `&self` response parsers (e.g. the DML/batch error-info parse, which
@@ -835,11 +833,9 @@ impl Connection {
     }
 
     /// Set how many rows each query requests from the server in the initial
-    /// execute. Raise this above the default (100) when you expect large result
-    /// sets: `fetch_more` is currently broken on pre-23c servers, so the initial
-    /// execute must return the whole result (it reads multi-packet responses
-    /// correctly). Has no effect on result correctness, only on how many rows
-    /// come back before `has_more_rows` is set.
+    /// execute (default 100). Raising this returns large result sets in one
+    /// round-trip instead of via repeated `fetch_more` calls. Has no effect on
+    /// correctness, only on how many rows come back before `has_more_rows` is set.
     pub fn set_prefetch_rows(&self, rows: u32) {
         self.prefetch_rows.store(rows.max(1), Ordering::Relaxed);
     }
@@ -1788,7 +1784,8 @@ impl Connection {
     /// let mut all_rows = result.rows.clone();
     ///
     /// while result.has_more_rows {
-    ///     result = conn.fetch_more(result.cursor_id, &result.columns, 100).await?;
+    ///     let prev = result.rows.last().map(|r| r.values().to_vec());
+    ///     result = conn.fetch_more(result.cursor_id, &result.columns, 100, prev.as_deref()).await?;
     ///     all_rows.extend(result.rows);
     /// }
     /// ```
@@ -1797,36 +1794,25 @@ impl Connection {
         cursor_id: u16,
         columns: &[ColumnInfo],
         fetch_size: u32,
+        prev_row: Option<&[Value]>,
     ) -> Result<QueryResult> {
         self.ensure_ready().await?;
 
-        // Build fetch message
-        // KNOWN BUG (19c): the server rejects this fetch RPC with a break MARKER
-        // (packet type 12), so incremental fetching beyond the first prefetch
-        // batch does not work on pre-23c. Setting the TTC sequence number did
-        // not resolve it; the fetch message framing needs a byte-for-byte
-        // comparison against python-oracledb's MessageWithData fetch. Until then
-        // the workaround is a prefetch large enough to return the whole result
-        // in the initial execute (the multi-packet reader handles that).
+        // Build the fetch message. build_request honors the connection's SDU
+        // width in the packet header, and the sequence number must continue the
+        // connection's sequence (a 0 here, or a small-SDU header on a large-SDU
+        // connection, makes the server abort the call with a break MARKER).
         let mut fetch_msg = FetchMessage::new(cursor_id, fetch_size);
 
         let mut inner = self.inner.lock().await;
         fetch_msg.set_sequence_number(inner.next_sequence_number());
-        let request = fetch_msg.build_request(&inner.capabilities)?;
+        let large_sdu = inner.large_sdu;
+        let request = fetch_msg.build_request(&inner.capabilities, large_sdu)?;
         inner.send(&request).await?;
 
-        // Receive and parse response
+        // Receive and parse response. A break MARKER here means the server raised
+        // an error mid-call; run the reset handshake and surface the real error.
         let response = inner.receive().await?;
-        // KNOWN BUG (19c): the server rejects this fetch RPC and interrupts with a
-        // break MARKER (the reset protocol then yields no error packet / a closed
-        // connection). The fetch request is byte-correct vs python-oracledb
-        // (msg=Function, func=Fetch, correct seq, cursor_id, array_size), so the
-        // cause is a subtler cursor-state mismatch in the preceding execute that
-        // needs a side-by-side python-oracledb wire capture to pin down. Until
-        // then, incremental fetch past the first prefetch batch is unavailable;
-        // use a large `prefetch_rows` so the initial execute returns everything.
-        // We run the reset handshake so the failure surfaces loudly instead of
-        // silently returning zero rows.
         if response.get(4) == Some(&(PacketType::Marker as u8)) {
             let err_pkt = inner.handle_marker_reset().await?;
             let payload = &err_pkt[PACKET_HEADER_SIZE..];
@@ -1836,11 +1822,14 @@ impl Connection {
             return Err(Error::Protocol("Empty fetch response".to_string()));
         }
 
-        // Parse row data from response
+        // Parse row data. parse_fetch_response doesn't carry the cursor id, so
+        // preserve the one we fetched from to allow further draining.
         let payload = &response[PACKET_HEADER_SIZE..];
         let caps = inner.capabilities.clone();
         drop(inner); // Release lock before parsing
-        self.parse_fetch_response(payload, columns, &caps)
+        let mut result = self.parse_fetch_response(payload, columns, &caps, prev_row)?;
+        result.cursor_id = cursor_id;
+        Ok(result)
     }
 
     /// Fetch rows from a REF CURSOR
@@ -1941,7 +1930,7 @@ impl Connection {
         let payload = &response[PACKET_HEADER_SIZE..];
         let caps = inner.capabilities.clone();
         drop(inner); // Release lock before parsing
-        self.parse_fetch_response(payload, cursor.columns(), &caps)
+        self.parse_fetch_response(payload, cursor.columns(), &caps, None)
     }
 
     /// Fetch rows from an implicit result set
@@ -1991,7 +1980,7 @@ impl Connection {
     /// - RowHeader (6): Contains metadata about the following row data
     /// - RowData (7): Contains the actual row values
     /// - Error (4): Contains error info with cursor_id and row counts
-    fn parse_fetch_response(&self, payload: &[u8], columns: &[ColumnInfo], caps: &Capabilities) -> Result<QueryResult> {
+    fn parse_fetch_response(&self, payload: &[u8], columns: &[ColumnInfo], caps: &Capabilities, prev_row: Option<&[Value]>) -> Result<QueryResult> {
         if payload.len() < 3 {
             return Err(Error::Protocol("Fetch response too short".to_string()));
         }
@@ -2000,9 +1989,11 @@ impl Connection {
         let mut rows = Vec::new();
         let mut has_more_rows = false;
 
-        // Bit vector for duplicate column optimization
+        // Bit vector for duplicate column optimization. Seed previous_row_values
+        // with the last row of the prior batch: the first row of a fetched batch
+        // can mark columns as duplicates of it (otherwise they decode as NULL).
         let mut bit_vector: Option<Vec<u8>> = None;
-        let mut previous_row_values: Option<Vec<Value>> = None;
+        let mut previous_row_values: Option<Vec<Value>> = prev_row.map(|r| r.to_vec());
 
         // Skip data flags
         buf.skip(2)?;
@@ -2055,13 +2046,16 @@ impl Connection {
                     // Continue processing - RowData follows
                 }
                 x if x == MessageType::Error as u8 => {
-                    // Error message contains row count and cursor info
-                    let (error_code, error_msg, more_rows) = self.parse_error_message_info(&mut buf)?;
-                    has_more_rows = more_rows;
+                    // Terminal end-of-call message. Use the same parser as the
+                    // query path (correct rowid structure + 20c-field gating);
+                    // the cursor is exhausted only on ORA-01403.
+                    let (error_code, error_msg, _cid, _rc) = self
+                        .parse_error_info_with_rowcount(&mut buf, self.field_version.load(Ordering::Relaxed))?;
+                    has_more_rows = error_code != 1403;
                     if error_code != 0 && error_code != 1403 { // 1403 = no data found
                         return Err(Error::OracleError {
                             code: error_code,
-                            message: error_msg,
+                            message: error_msg.unwrap_or_default(),
                         });
                     }
                     break; // Error message marks end of response
@@ -2087,72 +2081,6 @@ impl Connection {
             has_more_rows,
             cursor_id: 0,
         })
-    }
-
-    /// Parse error message info including cursor_id and row counts
-    fn parse_error_message_info(&self, buf: &mut ReadBuffer) -> Result<(u32, String, bool)> {
-        let _call_status = buf.read_ub4()?; // end of call status
-        buf.skip_ub2()?; // end to end seq#
-        buf.skip_ub4()?; // current row number
-        buf.skip_ub2()?; // error number
-        buf.skip_ub2()?; // array elem error
-        buf.skip_ub2()?; // array elem error
-        let _cursor_id = buf.read_ub2()?; // cursor id
-        let _error_pos = buf.read_sb2()?; // error position
-        buf.skip(1)?; // sql type
-        buf.skip(1)?; // fatal?
-        buf.skip(1)?; // flags
-        buf.skip(1)?; // user cursor options
-        buf.skip(1)?; // UPI parameter
-        let _flags = buf.read_u8()?; // flags (0x20 = compilation warning; not more-rows)
-        // Skip rowid - fixed 10 bytes in Oracle format
-        buf.skip(10)?; // rowid is 10 bytes
-        buf.skip_ub4()?; // OS error
-        buf.skip(1)?; // statement number
-        buf.skip(1)?; // call number
-        buf.skip_ub2()?; // padding
-        buf.skip_ub4()?; // success iters
-        let num_bytes = buf.read_ub4()?; // oerrdd
-        if num_bytes > 0 {
-            buf.skip_raw_bytes_chunked()?;
-        }
-
-        // Skip batch error codes
-        let num_errors = buf.read_ub2()?;
-        if num_errors > 0 {
-            buf.skip_raw_bytes_chunked()?;
-        }
-
-        // Skip batch error offsets
-        let num_offsets = buf.read_ub4()?;
-        if num_offsets > 0 {
-            buf.skip_raw_bytes_chunked()?;
-        }
-
-        // Skip batch error messages
-        let temp16 = buf.read_ub2()?;
-        if temp16 > 0 {
-            buf.skip_raw_bytes_chunked()?;
-        }
-
-        // Read extended error info
-        let error_num = buf.read_ub4()?;
-        let _row_count = buf.read_ub8()?;
-        // During a fetch the server signals cursor exhaustion with ORA-01403
-        // (no data found). Any other terminal status (typically 0) means more
-        // rows remain to fetch. (The previous `row_count > 0 || flags & 0x20`
-        // heuristic was wrong: flags 0x20 is the compilation-warning bit, and
-        // row_count is cumulative — it reported "done" while rows remained.)
-        let more_rows = error_num != 1403;
-
-        // Read error message if present
-        let error_msg = if error_num != 0 {
-            buf.read_string_with_length()?.unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        Ok((error_num, error_msg, more_rows))
     }
 
     /// Open a scrollable cursor for bidirectional navigation
