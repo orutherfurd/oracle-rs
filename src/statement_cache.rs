@@ -71,6 +71,11 @@ pub struct StatementCache {
     cache: IndexMap<String, CachedStatement>,
     /// Maximum number of statements to cache
     max_size: usize,
+    /// Server-side cursor ids that were orphaned locally (cursor reset or LRU
+    /// eviction) and still need a close-cursors message sent to the server.
+    /// Drained by the connection as a piggyback on the next request; without
+    /// this a long-lived (pooled) connection leaks cursors until ORA-01000.
+    cursors_to_close: Vec<u16>,
 }
 
 impl StatementCache {
@@ -81,6 +86,28 @@ impl StatementCache {
         Self {
             cache: IndexMap::with_capacity(max_size),
             max_size,
+            cursors_to_close: Vec::new(),
+        }
+    }
+
+    /// Server-side cursor ids awaiting a close-cursors message.
+    pub fn cursors_to_close(&self) -> &[u16] {
+        &self.cursors_to_close
+    }
+
+    /// Clear the pending close-cursors queue (call after the close has been
+    /// sent to the server).
+    pub fn clear_cursors_to_close(&mut self) {
+        self.cursors_to_close.clear();
+    }
+
+    /// Queue a server-side cursor id for a close-cursors message on the next
+    /// request. Used by the connection to close the cursor a query actually
+    /// used (which, on the cache-reuse path, is never written back into the
+    /// cached statement). Ignores 0 (no cursor).
+    pub fn queue_cursor_to_close(&mut self, cursor_id: u16) {
+        if cursor_id != 0 {
+            self.cursors_to_close.push(cursor_id);
         }
     }
 
@@ -178,12 +205,17 @@ impl StatementCache {
     /// Oracle. This prevents data corruption from reusing stale cursor IDs.
     ///
     /// Following python-oracledb's clear_cursor design pattern.
+    ///
+    /// Resets the cached cursor id to 0 so the next execution re-parses and
+    /// gets a fresh cursor. This does not free the cursor on the server; the
+    /// connection queues the cursor it actually used via
+    /// [`queue_cursor_to_close`](Self::queue_cursor_to_close).
     pub fn mark_cursor_closed(&mut self, sql: &str) {
         if let Some(cached) = self.cache.get_mut(sql) {
             if cached.statement.cursor_id() != 0 {
                 cached.statement.set_cursor_id(0);
                 cached.statement.set_executed(false);
-                tracing::trace!(sql = sql, "Cursor closed, reset cursor_id to 0");
+                tracing::trace!(sql = sql, "Cursor reset to 0");
             }
         }
     }
@@ -191,8 +223,12 @@ impl StatementCache {
     /// Clear all cached statements
     ///
     /// This should be called when the session changes (e.g., DRCP session switch).
+    /// Pending close-cursors ids are dropped too: they belong to the old
+    /// session, so closing them against a new session could target an unrelated
+    /// cursor.
     pub fn clear(&mut self) {
         self.cache.clear();
+        self.cursors_to_close.clear();
         tracing::debug!("Statement cache cleared");
     }
 
@@ -223,11 +259,13 @@ impl StatementCache {
 
         if let Some(key) = lru_key {
             if let Some(cached) = self.cache.swap_remove(&key) {
-                tracing::trace!(
-                    sql = key,
-                    cursor_id = cached.statement.cursor_id(),
-                    "Evicted LRU statement from cache"
-                );
+                let cursor_id = cached.statement.cursor_id();
+                tracing::trace!(sql = key, cursor_id, "Evicted LRU statement from cache");
+                // The evicted statement's server cursor is still open; queue it
+                // for closing so eviction does not leak cursors.
+                if cursor_id != 0 {
+                    self.cursors_to_close.push(cursor_id);
+                }
             }
         } else {
             // All statements are in use - this is rare but possible
@@ -400,5 +438,65 @@ mod tests {
 
         let cached = cache.get("SELECT 1 FROM DUAL").unwrap();
         assert_eq!(cached.cursor_id(), 200);
+    }
+
+    #[test]
+    fn test_mark_cursor_closed_resets_without_queuing() {
+        let mut cache = StatementCache::new(5);
+        cache.put(
+            "SELECT 1 FROM DUAL".to_string(),
+            make_test_statement("SELECT 1 FROM DUAL", 42),
+        );
+
+        // mark_cursor_closed only resets the cached cursor locally; queuing the
+        // server close is the connection's job (it knows the real cursor used).
+        cache.mark_cursor_closed("SELECT 1 FROM DUAL");
+        assert_eq!(cache.get("SELECT 1 FROM DUAL").unwrap().cursor_id(), 0);
+        assert!(cache.cursors_to_close().is_empty());
+    }
+
+    #[test]
+    fn test_queue_and_drain_cursors_to_close() {
+        let mut cache = StatementCache::new(5);
+        assert!(cache.cursors_to_close().is_empty());
+
+        cache.queue_cursor_to_close(42);
+        cache.queue_cursor_to_close(0); // 0 = no cursor, ignored
+        cache.queue_cursor_to_close(100);
+        assert_eq!(cache.cursors_to_close(), &[42, 100]);
+
+        // Draining clears the queue (called once the close is on the wire).
+        cache.clear_cursors_to_close();
+        assert!(cache.cursors_to_close().is_empty());
+    }
+
+    #[test]
+    fn test_lru_eviction_queues_evicted_cursor() {
+        let mut cache = StatementCache::new(1);
+        cache.put(
+            "SELECT 1 FROM DUAL".to_string(),
+            make_test_statement("SELECT 1 FROM DUAL", 7),
+        );
+        // Inserting a second statement evicts the first; its server cursor
+        // (id 7) is still open and must be queued for closing.
+        cache.put(
+            "SELECT 2 FROM DUAL".to_string(),
+            make_test_statement("SELECT 2 FROM DUAL", 8),
+        );
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.cursors_to_close(), &[7]);
+    }
+
+    #[test]
+    fn test_clear_drops_pending_closes() {
+        let mut cache = StatementCache::new(5);
+        cache.queue_cursor_to_close(5);
+        assert_eq!(cache.cursors_to_close(), &[5]);
+
+        // A session change abandons the old cursors; queued ids must be dropped
+        // so we never close a cursor id belonging to a different session.
+        cache.clear();
+        assert!(cache.cursors_to_close().is_empty());
     }
 }
