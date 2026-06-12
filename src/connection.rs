@@ -743,6 +743,40 @@ pub struct Connection {
 // Connection ID counter
 static CONNECTION_ID_COUNTER: AtomicU32 = AtomicU32::new(1);
 
+/// Poisons a connection if an in-flight TTC round-trip is cancelled — i.e. the
+/// operation's future is dropped after the request was sent but before the
+/// response was fully read. That leaves the stream mid-frame; reusing the
+/// connection (e.g. from a pool) then hangs or draws a server BREAK. Arm before
+/// the round-trip, `disarm()` once it completes; if the future is dropped in
+/// between, `Drop` marks the connection closed so callers/pools discard it
+/// instead of reusing a corrupted one.
+struct CancelPoison<'a> {
+    conn: &'a Connection,
+    armed: bool,
+}
+
+impl<'a> CancelPoison<'a> {
+    fn arm(conn: &'a Connection) -> Self {
+        Self { conn, armed: true }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelPoison<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.conn.mark_closed();
+            tracing::warn!(
+                conn = self.conn.id,
+                "operation cancelled mid-round-trip; connection poisoned to prevent reuse"
+            );
+        }
+    }
+}
+
 impl Connection {
     /// Create a new connection to an Oracle database
     ///
@@ -2406,8 +2440,17 @@ impl Connection {
         }
     }
 
-    /// Internal: Execute a query statement with optional bind parameters
+    /// Internal: Execute a query statement with optional bind parameters.
+    /// Guards the round-trip so a cancelled future poisons the connection rather
+    /// than leaving the stream desynced for the next (pooled) reuse.
     async fn execute_query_with_params(&self, statement: &Statement, params: &[Value]) -> Result<QueryResult> {
+        let poison = CancelPoison::arm(self);
+        let out = self.execute_query_with_params_inner(statement, params).await;
+        poison.disarm();
+        out
+    }
+
+    async fn execute_query_with_params_inner(&self, statement: &Statement, params: &[Value]) -> Result<QueryResult> {
         let prefetch_rows = self.prefetch_rows.load(Ordering::Relaxed);
 
         // For first execution, check if we might have LOBs (no prefetch for safety)
@@ -2508,8 +2551,17 @@ impl Connection {
         Ok(result)
     }
 
-    /// Internal: Execute a DML statement with optional bind parameters
+    /// Internal: Execute a DML statement with optional bind parameters.
+    /// Guards the round-trip so a cancelled future poisons the connection rather
+    /// than leaving the stream desynced for the next (pooled) reuse.
     async fn execute_dml_with_params(&self, statement: &Statement, params: &[Value]) -> Result<QueryResult> {
+        let poison = CancelPoison::arm(self);
+        let out = self.execute_dml_with_params_inner(statement, params).await;
+        poison.disarm();
+        out
+    }
+
+    async fn execute_dml_with_params_inner(&self, statement: &Statement, params: &[Value]) -> Result<QueryResult> {
         let options = ExecuteOptions::for_dml(false); // Don't auto-commit
         let mut execute_msg = ExecuteMessage::new(statement, options);
 
