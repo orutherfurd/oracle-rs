@@ -270,6 +270,25 @@ impl OracleStream {
 
 }
 
+/// Insert piggyback bytes into a single-packet request, right after the 2-byte
+/// data flags, and fix up the packet length in the header. Requests built by
+/// the message layer are a single DATA packet: `[header][data flags][TTC]`.
+fn splice_piggyback(request: &[u8], piggyback: &[u8], large_sdu: bool) -> bytes::Bytes {
+    use bytes::{BufMut, BytesMut};
+    let insert_at = PACKET_HEADER_SIZE + 2; // 8-byte header + 2-byte data flags
+    let new_len = request.len() + piggyback.len();
+    let mut out = BytesMut::with_capacity(new_len);
+    out.put_slice(&request[..insert_at]);
+    out.put_slice(piggyback);
+    out.put_slice(&request[insert_at..]);
+    if large_sdu {
+        out[0..4].copy_from_slice(&(new_len as u32).to_be_bytes());
+    } else {
+        out[0..2].copy_from_slice(&(new_len as u16).to_be_bytes());
+    }
+    out.freeze()
+}
+
 /// Internal connection state shared across async operations
 struct ConnectionInner {
     stream: Option<OracleStream>,
@@ -319,6 +338,56 @@ impl ConnectionInner {
         } else {
             Err(Error::ConnectionClosed)
         }
+    }
+
+    /// Build a close-cursors piggyback (TTC message type 17, function 105) for
+    /// the given server-side cursor ids.
+    ///
+    /// The returned bytes are a bare TTC message (no data flags, no packet
+    /// header); they are spliced into the next request packet right after the
+    /// 2-byte data flags and before the function message, the way
+    /// python-oracledb piggybacks cursor closes onto a subsequent call.
+    fn build_close_cursors_piggyback(&mut self, cursors: &[u16]) -> Result<bytes::Bytes> {
+        let seq = self.next_sequence_number();
+        let mut buf = WriteBuffer::new();
+        buf.write_u8(MessageType::Piggyback as u8)?;
+        buf.write_u8(FunctionCode::CloseCursors as u8)?;
+        buf.write_u8(seq)?;
+        // Token number is present only on 23ai (mirrors the execute header).
+        if self.capabilities.ttc_field_version >= 18 {
+            buf.write_ub8(0)?;
+        }
+        buf.write_u8(1)?; // pointer to the cursor array (per python-oracledb)
+        buf.write_ub4(cursors.len() as u32)?;
+        for &cursor_id in cursors {
+            buf.write_ub4(cursor_id as u32)?;
+        }
+        Ok(buf.freeze())
+    }
+
+    /// Send a request packet, first splicing in a close-cursors piggyback for
+    /// any cursors the statement cache has orphaned since the last round-trip.
+    /// The piggyback rides on the request that is already going out, so freeing
+    /// server-side cursors costs no extra round-trip. The cache's pending list
+    /// is cleared only after a successful send (a failed send means the
+    /// connection is being torn down anyway, and a still-usable one will retry
+    /// the close on its next request).
+    async fn send_with_close_piggyback(&mut self, request: &[u8], large_sdu: bool) -> Result<()> {
+        let cursors: Vec<u16> = self
+            .statement_cache
+            .as_ref()
+            .map(|cache| cache.cursors_to_close().to_vec())
+            .unwrap_or_default();
+        if cursors.is_empty() {
+            return self.send(request).await;
+        }
+        let piggyback = self.build_close_cursors_piggyback(&cursors)?;
+        let packet = splice_piggyback(request, &piggyback, large_sdu);
+        self.send(&packet).await?;
+        if let Some(ref mut cache) = self.statement_cache {
+            cache.clear_cursors_to_close();
+        }
+        Ok(())
     }
 
     /// Send a payload that may need to be split across multiple packets.
@@ -2468,7 +2537,7 @@ impl Connection {
         let seq_num = inner.next_sequence_number();
         execute_msg.set_sequence_number(seq_num);
         let request = execute_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
-        inner.send(&request).await?;
+        inner.send_with_close_piggyback(&request, large_sdu).await?;
 
         // Receive and parse response
         let response = inner.receive().await?;
@@ -2548,6 +2617,17 @@ impl Connection {
             )?;
         }
 
+        // Once a query is fully fetched, the statement cache resets its cursor
+        // to 0 (it never reuses a server cursor), so the cursor the server
+        // actually used must be closed. Queue it for the next request's
+        // close-cursors piggyback — otherwise a long-lived pooled connection
+        // leaks cursors until ORA-01000.
+        if !result.has_more_rows {
+            if let Some(ref mut cache) = inner.statement_cache {
+                cache.queue_cursor_to_close(result.cursor_id);
+            }
+        }
+
         Ok(result)
     }
 
@@ -2576,7 +2656,7 @@ impl Connection {
         execute_msg.set_sequence_number(seq_num);
         let request = execute_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
 
-        inner.send(&request).await?;
+        inner.send_with_close_piggyback(&request, large_sdu).await?;
 
         // Receive response
         let mut response = inner.receive().await?;
@@ -2695,7 +2775,13 @@ impl Connection {
 
         // Parse the response to extract rows affected (or error)
         let payload = &response[PACKET_HEADER_SIZE..];
-        self.parse_dml_response(payload)
+        let result = self.parse_dml_response(payload)?;
+        // DML/DDL has no fetch phase, so its cursor is done; close it on the
+        // server via the next request's piggyback (see the query path).
+        if let Some(ref mut cache) = inner.statement_cache {
+            cache.queue_cursor_to_close(result.cursor_id);
+        }
+        Ok(result)
     }
 
     /// Parse query response to extract columns and rows
@@ -5430,6 +5516,58 @@ fn oracle_type_from_name(type_name: &str) -> crate::constants::OracleType {
 mod tests {
     use super::*;
     use crate::row::Value;
+
+    #[test]
+    fn test_close_cursors_piggyback_encoding() {
+        // Pre-23c server: no token number in the piggyback header.
+        let mut inner = ConnectionInner::new_with_cache(20);
+        inner.capabilities.ttc_field_version = 11;
+
+        let bytes = inner
+            .build_close_cursors_piggyback(&[42, 100])
+            .expect("piggyback builds");
+
+        // type=Piggyback(17), func=CloseCursors(105), seq=1 (first message),
+        // pointer(1), then ub4 count=2 and ub4 of each cursor id
+        // (1..=255 → [0x01, value]).
+        assert_eq!(
+            &bytes[..],
+            &[
+                MessageType::Piggyback as u8,
+                FunctionCode::CloseCursors as u8,
+                1,
+                0x01,       // pointer to cursor array
+                0x01, 0x02, // count = 2
+                0x01, 42,   // cursor 42
+                0x01, 100,  // cursor 100
+            ]
+        );
+    }
+
+    #[test]
+    fn test_splice_piggyback_inserts_after_data_flags_and_fixes_length() {
+        // request = [8-byte header][2-byte data flags][2-byte TTC body]
+        let request = [
+            0, 12, 0, 0, PacketType::Data as u8, 0, 0, 0, // header (len = 12)
+            0xDF, 0xDF, // data flags
+            0xAA, 0xBB, // TTC body
+        ];
+        let piggyback = [0x11, 0x69]; // arbitrary 2 bytes
+
+        let out = splice_piggyback(&request, &piggyback, false);
+
+        // Piggyback lands between the data flags and the TTC body; the rest is
+        // untouched and the length header is rewritten to the new total.
+        assert_eq!(
+            &out[..],
+            &[
+                0, 14, 0, 0, PacketType::Data as u8, 0, 0, 0, // len fixed to 14
+                0xDF, 0xDF, // data flags
+                0x11, 0x69, // spliced piggyback
+                0xAA, 0xBB, // original TTC body
+            ]
+        );
+    }
 
     #[test]
     fn test_query_options_default() {
