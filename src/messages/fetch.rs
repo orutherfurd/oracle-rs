@@ -138,7 +138,7 @@ mod tests {
         let msg = FetchMessage::new(1, 100);
         let caps = Capabilities::new();
 
-        let packet = msg.build_request(&caps).unwrap();
+        let packet = msg.build_request(&caps, false).unwrap();
 
         // Check packet header
         assert!(packet.len() > PACKET_HEADER_SIZE);

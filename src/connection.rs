@@ -1810,8 +1810,8 @@ impl Connection {
         let request = fetch_msg.build_request(&inner.capabilities, large_sdu)?;
         inner.send(&request).await?;
 
-        // Receive and parse response. A break MARKER here means the server raised
-        // an error mid-call; run the reset handshake and surface the real error.
+        // Receive the response. A break MARKER here means the server raised an error
+        // mid-call; run the reset handshake and surface the real error.
         let response = inner.receive().await?;
         if response.get(4) == Some(&(PacketType::Marker as u8)) {
             let err_pkt = inner.handle_marker_reset().await?;
@@ -1822,12 +1822,26 @@ impl Connection {
             return Err(Error::Protocol("Empty fetch response".to_string()));
         }
 
-        // Parse row data. parse_fetch_response doesn't carry the cursor id, so
-        // preserve the one we fetched from to allow further draining.
-        let payload = &response[PACKET_HEADER_SIZE..];
+        // A fetch batch can span several TNS packets — wide rows overflow the SDU, and
+        // pre-23c servers send no END_OF_RESPONSE flag — so read packets until the
+        // parser reaches the terminal end-of-call message. A BufferUnderflow means a
+        // row straddles a packet boundary; same remedy: append the next packet (minus
+        // its 2-byte data-flags prefix) and re-parse. Mirrors the query path in
+        // `execute_query_with_params`. parse_fetch_response doesn't carry the cursor
+        // id, so preserve the one we fetched from to allow further draining.
         let caps = inner.capabilities.clone();
-        drop(inner); // Release lock before parsing
-        let mut result = self.parse_fetch_response(payload, columns, &caps, prev_row)?;
+        let mut accumulated: Vec<u8> = response[PACKET_HEADER_SIZE..].to_vec();
+        let mut result = loop {
+            match self.parse_fetch_response_eor(&accumulated, columns, &caps, prev_row) {
+                Ok((res, true)) => break res,
+                Ok((_, false)) | Err(Error::BufferUnderflow { .. }) => {
+                    let pkt = inner.receive().await?;
+                    accumulated.extend_from_slice(&pkt[PACKET_HEADER_SIZE + 2..]);
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        drop(inner); // Release lock before returning
         result.cursor_id = cursor_id;
         Ok(result)
     }
@@ -1980,7 +1994,13 @@ impl Connection {
     /// - RowHeader (6): Contains metadata about the following row data
     /// - RowData (7): Contains the actual row values
     /// - Error (4): Contains error info with cursor_id and row counts
-    fn parse_fetch_response(&self, payload: &[u8], columns: &[ColumnInfo], caps: &Capabilities, prev_row: Option<&[Value]>) -> Result<QueryResult> {
+    /// Parse a fetch response, also reporting whether the terminal end-of-call
+    /// message was reached (`true`). When `false`, this packet held only part of the
+    /// batch — a row straddled the SDU boundary, or the packet ended between messages
+    /// — and the caller must append the next packet and re-parse (see `fetch_more`).
+    /// Wide rows make a single fetch batch span several TNS packets, so a one-packet
+    /// parse underran the buffer mid-row.
+    fn parse_fetch_response_eor(&self, payload: &[u8], columns: &[ColumnInfo], caps: &Capabilities, prev_row: Option<&[Value]>) -> Result<(QueryResult, bool)> {
         if payload.len() < 3 {
             return Err(Error::Protocol("Fetch response too short".to_string()));
         }
@@ -1988,6 +2008,7 @@ impl Connection {
         let mut buf = ReadBuffer::from_slice(payload);
         let mut rows = Vec::new();
         let mut has_more_rows = false;
+        let mut end_of_response = false;
 
         // Bit vector for duplicate column optimization. Seed previous_row_values
         // with the last row of the prior batch: the first row of a fetched batch
@@ -2004,7 +2025,9 @@ impl Connection {
 
             match msg_type {
                 x if x == MessageType::RowHeader as u8 => {
-                    // Skip row header metadata (per Python's _process_row_header)
+                    // Skip row header metadata (per Python's _process_row_header). The
+                    // header carries the first row's bit vector, which can mark columns
+                    // as duplicates of the seeded previous row.
                     buf.skip(1)?; // flags
                     buf.skip_ub2()?; // num requests
                     buf.skip_ub4()?; // iteration number
@@ -2013,7 +2036,6 @@ impl Connection {
                     let num_bytes = buf.read_ub4()?;
                     if num_bytes > 0 {
                         buf.skip(1)?; // skip repeated length
-                        // This bit vector in row header is for the following row data
                         let bv = buf.read_bytes_vec(num_bytes as usize)?;
                         bit_vector = Some(bv);
                     }
@@ -2023,7 +2045,6 @@ impl Connection {
                     }
                 }
                 x if x == MessageType::RowData as u8 => {
-                    // Parse actual row data with bit vector support
                     let row = self.parse_row_data_with_bitvector(
                         &mut buf,
                         columns,
@@ -2038,7 +2059,7 @@ impl Connection {
                 x if x == MessageType::BitVector as u8 => {
                     // BitVector indicates which columns have actual data vs duplicates
                     let _num_columns_sent = buf.read_ub2()?;
-                    let num_bytes = (columns.len() + 7) / 8; // Round up
+                    let num_bytes = (columns.len() + 7) / 8; // 1 bit per column, rounded up
                     if num_bytes > 0 {
                         let bv = buf.read_bytes_vec(num_bytes)?;
                         bit_vector = Some(bv);
@@ -2058,29 +2079,44 @@ impl Connection {
                             message: error_msg.unwrap_or_default(),
                         });
                     }
+                    end_of_response = true;
                     break; // Error message marks end of response
                 }
                 x if x == MessageType::Status as u8 => {
-                    // Status message - usually marks end
+                    // Status message - marks end of response
+                    end_of_response = true;
                     break;
                 }
                 x if x == MessageType::EndOfResponse as u8 => {
+                    end_of_response = true;
                     break;
                 }
                 _ => {
                     // Unknown message type - stop processing
+                    end_of_response = true;
                     break;
                 }
             }
         }
 
-        Ok(QueryResult {
-            columns: columns.to_vec(),
-            rows,
-            rows_affected: 0,
-            has_more_rows,
-            cursor_id: 0,
-        })
+        Ok((
+            QueryResult {
+                columns: columns.to_vec(),
+                rows,
+                rows_affected: 0,
+                has_more_rows,
+                cursor_id: 0,
+            },
+            end_of_response,
+        ))
+    }
+
+    /// Back-compat wrapper: parse a single-packet fetch response, discarding the
+    /// end-of-response signal. Callers that may receive a multi-packet batch should
+    /// accumulate packets and use `parse_fetch_response_eor` (see `fetch_more`).
+    fn parse_fetch_response(&self, payload: &[u8], columns: &[ColumnInfo], caps: &Capabilities, prev_row: Option<&[Value]>) -> Result<QueryResult> {
+        self.parse_fetch_response_eor(payload, columns, caps, prev_row)
+            .map(|(result, _eor)| result)
     }
 
     /// Open a scrollable cursor for bidirectional navigation
