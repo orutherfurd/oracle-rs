@@ -200,16 +200,64 @@ impl<'a> ExecuteMessage<'a> {
 
     /// Set bind values for execution (single row)
     pub fn set_bind_values(&mut self, values: Vec<Value>) {
+        let values = self.expand_duplicate_binds(values);
         self.batch_bind_values = vec![values];
     }
 
     /// Set bind values for batch execution (multiple rows)
     pub fn set_batch_bind_values(&mut self, rows: Vec<Vec<Value>>) {
-        self.batch_bind_values = rows;
+        self.batch_bind_values = rows
+            .into_iter()
+            .map(|row| self.expand_duplicate_binds(row))
+            .collect();
         // Update num_execs to match batch size
         if !self.batch_bind_values.is_empty() {
             self.options.num_execs = self.batch_bind_values.len() as u32;
         }
+    }
+
+    /// Expand one value per *unique* bind into one value per *occurrence*.
+    ///
+    /// `bind_info` lists every placeholder occurrence in the SQL (a repeated
+    /// `:1` appears twice). Oracle — like python-oracledb — sends one bind per
+    /// occurrence, so the caller supplies a single value for `:1` and it is
+    /// duplicated onto each occurrence here. Without this, the wire body
+    /// (per-value) under-fills the header's per-occurrence bind count and the
+    /// round-trip desyncs (the connection hangs).
+    ///
+    /// Returns the values unchanged when there are no duplicate binds, or when
+    /// the caller already supplied one value per occurrence (back-compat), or
+    /// when the count matches neither (left for the caller's error path).
+    fn expand_duplicate_binds(&self, values: Vec<Value>) -> Vec<Value> {
+        let bind_info = self.statement.bind_info();
+        if bind_info.is_empty() {
+            return values;
+        }
+        // Unique bind names, in order of first appearance.
+        let mut unique: Vec<&str> = Vec::new();
+        for b in bind_info {
+            if !unique.iter().any(|n| *n == b.name.as_str()) {
+                unique.push(b.name.as_str());
+            }
+        }
+        // No duplicates, or already one value per occurrence: nothing to do.
+        if unique.len() == bind_info.len() || values.len() == bind_info.len() {
+            return values;
+        }
+        // One value per unique bind: duplicate onto each occurrence.
+        if values.len() == unique.len() {
+            return bind_info
+                .iter()
+                .map(|b| {
+                    let idx = unique
+                        .iter()
+                        .position(|n| *n == b.name.as_str())
+                        .expect("bind name is in the unique list");
+                    values[idx].clone()
+                })
+                .collect();
+        }
+        values
     }
 
     /// Check if there are bind values
@@ -1153,6 +1201,42 @@ mod tests {
         let opts = ExecuteOptions::for_query(100);
         let msg = ExecuteMessage::new(&stmt, opts);
         assert_eq!(msg.function_code(), FunctionCode::Execute);
+    }
+
+    #[test]
+    fn test_duplicate_bind_expands_to_each_occurrence() {
+        // `:1` twice is one unique bind; one value fills both occurrences so the
+        // wire body matches the per-occurrence bind count in the header.
+        let stmt = Statement::new("SELECT :1 AS a, :1 AS b FROM dual");
+        let mut msg = ExecuteMessage::new(&stmt, ExecuteOptions::for_query(100));
+        msg.set_bind_values(vec![Value::Integer(7)]);
+        assert_eq!(format!("{:?}", msg.batch_bind_values), "[[Integer(7), Integer(7)]]");
+    }
+
+    #[test]
+    fn test_distinct_binds_are_not_expanded() {
+        let stmt = Statement::new("SELECT :1 AS a, :2 AS b FROM dual");
+        let mut msg = ExecuteMessage::new(&stmt, ExecuteOptions::for_query(100));
+        msg.set_bind_values(vec![Value::Integer(7), Value::Integer(8)]);
+        assert_eq!(format!("{:?}", msg.batch_bind_values), "[[Integer(7), Integer(8)]]");
+    }
+
+    #[test]
+    fn test_mixed_duplicate_bind_maps_by_first_appearance() {
+        // unique order [a, b]; `:a` repeats at the end and reuses a's value.
+        let stmt = Statement::new("SELECT :a, :b, :a FROM dual");
+        let mut msg = ExecuteMessage::new(&stmt, ExecuteOptions::for_query(100));
+        msg.set_bind_values(vec![Value::Integer(1), Value::Integer(2)]);
+        assert_eq!(format!("{:?}", msg.batch_bind_values), "[[Integer(1), Integer(2), Integer(1)]]");
+    }
+
+    #[test]
+    fn test_per_occurrence_values_left_unchanged() {
+        // Caller already supplied one value per occurrence: back-compat, no remap.
+        let stmt = Statement::new("SELECT :1 AS a, :1 AS b FROM dual");
+        let mut msg = ExecuteMessage::new(&stmt, ExecuteOptions::for_query(100));
+        msg.set_bind_values(vec![Value::Integer(7), Value::Integer(8)]);
+        assert_eq!(format!("{:?}", msg.batch_bind_values), "[[Integer(7), Integer(8)]]");
     }
 
     #[test]
