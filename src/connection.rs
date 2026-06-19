@@ -1899,8 +1899,28 @@ impl Connection {
         fetch_size: u32,
         prev_row: Option<&[Value]>,
     ) -> Result<QueryResult> {
+        // fetch_more sends a request and reads the response; like execute it is
+        // not cancellation-safe. Guard the round-trip so a future dropped between
+        // send and full read poisons the connection instead of leaving the stream
+        // desynced for the next (pooled) reuse. ensure_ready stays outside the
+        // guard (mirrors execute): a cancel before any bytes are sent must not
+        // poison a healthy connection.
         self.ensure_ready().await?;
+        let poison = CancelPoison::arm(self);
+        let out = self
+            .fetch_more_inner(cursor_id, columns, fetch_size, prev_row)
+            .await;
+        poison.disarm();
+        out
+    }
 
+    async fn fetch_more_inner(
+        &self,
+        cursor_id: u16,
+        columns: &[ColumnInfo],
+        fetch_size: u32,
+        prev_row: Option<&[Value]>,
+    ) -> Result<QueryResult> {
         // Build the fetch message. build_request honors the connection's SDU
         // width in the packet header, and the sequence number must continue the
         // connection's sequence (a 0 here, or a small-SDU header on a large-SDU

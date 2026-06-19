@@ -93,6 +93,54 @@ mod connection_tests {
         conn.close().await.expect("Failed to close connection");
     }
 
+    /// A `fetch_more` future cancelled mid-round-trip (request sent, response not
+    /// read) must poison the connection, so a pool discards it instead of reusing
+    /// a stream left desynced mid-frame. Without the guard the next reuse mis-decodes
+    /// the leftover bytes (`invalid length indicator`) or hangs.
+    #[tokio::test]
+    #[ignore = "requires Oracle database"]
+    async fn test_fetch_more_cancellation_poisons_connection() {
+        use std::future::Future;
+        use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+
+        fn noop_waker() -> Waker {
+            fn clone(_: *const ()) -> RawWaker {
+                RawWaker::new(std::ptr::null(), &VTABLE)
+            }
+            fn noop(_: *const ()) {}
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+            // SAFETY: clone/wake/drop are all no-ops over a null pointer.
+            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+        }
+
+        let conn = connect().await.expect("Failed to connect");
+
+        // A result wider than one prefetch batch leaves the cursor open, so draining
+        // it requires a fetch_more round-trip.
+        let first = conn
+            .query("SELECT level AS n FROM dual CONNECT BY level <= 1000", &[])
+            .await
+            .expect("initial query");
+        assert!(first.has_more_rows, "need an open cursor to fetch against");
+        let prev: Vec<_> = first.rows.last().unwrap().values().to_vec();
+
+        // Poll the fetch_more future once — the request goes out and the response
+        // read parks — then drop it without resolving: a cancellation mid-round-trip.
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(conn.fetch_more(first.cursor_id, &first.columns, 100, Some(&prev)));
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "fetch_more should park awaiting the response, not resolve in one poll"
+        );
+        drop(fut);
+
+        assert!(
+            conn.is_closed(),
+            "a cancelled fetch_more must poison the connection"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires Oracle database"]
     async fn test_invalid_credentials() {
